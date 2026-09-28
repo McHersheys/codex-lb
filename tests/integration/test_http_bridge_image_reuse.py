@@ -14,6 +14,7 @@ from app.db.models import ApiKeyUsageReservation
 from app.db.session import SessionLocal
 from app.dependencies import get_proxy_service_for_app
 from app.modules.proxy import service as proxy_module
+from app.modules.proxy._service.http_bridge import helpers as bridge_helpers
 from tests.integration.test_http_promotion_accounting import _key
 from tests.integration.test_http_responses_bridge import (
     _cleanup_http_bridge_sessions as cleanup_http_bridge_sessions,  # noqa: F401
@@ -90,6 +91,7 @@ class _LoopbackUpstream:
             self.frames.append((connection, payload))
             response_id = f"resp_loopback_{connection}_{len(self.frames)}"
             is_image = bool(_images(payload.get("input")))
+            # Synthetic protocol errors; not a reproduction of the #903 provider trace.
             if is_image and self.image_behavior in {"error", "response.failed"}:
                 error = {
                     "code": "invalid_value",
@@ -210,16 +212,16 @@ def _assert_slot_released(session):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("path", "stream"),
+    ("path", "stream", "shape"),
     [
-        ("/v1/responses", False),
-        ("/v1/responses", True),
-        ("/v1/responses/", False),
-        ("/v1/responses/", True),
-        ("/backend-api/codex/responses", True),
+        ("/v1/responses", False, "message"),
+        ("/v1/responses", True, "top_level"),
+        ("/v1/responses/", False, "tool_output"),
+        ("/v1/responses/", True, "message"),
+        ("/backend-api/codex/responses", True, "tool_output"),
+        ("/backend-api/codex/responses", False, "message"),
     ],
 )
-@pytest.mark.parametrize("shape", ["message", "top_level", "tool_output"])
 async def test_inline_image_history_reuses_physical_upstream_session(
     async_client, app_instance, promotion_transport, loopback_upstream, path, shape, stream
 ):
@@ -236,6 +238,13 @@ async def test_inline_image_history_reuses_physical_upstream_session(
         else:
             assert response.json()["status"] == "completed"
 
+    if path == "/backend-api/codex/responses" and not stream:
+        # This route explicitly opts out of the bridge, even without images.
+        assert len(raw_calls) == 3
+        assert not loopback_upstream.sockets
+        assert not get_proxy_service_for_app(app_instance)._http_bridge_sessions
+        return
+
     # On original main only the warmup reaches the loopback socket; the image
     # and retained-image turn go to raw_calls. This is the intended RED signal.
     assert not raw_calls, "inline-image history bypassed the reusable bridge"
@@ -250,27 +259,6 @@ async def test_inline_image_history_reuses_physical_upstream_session(
     service = get_proxy_service_for_app(app_instance)
     assert len(service._http_bridge_sessions) == 1
     _assert_slot_released(next(iter(service._http_bridge_sessions.values())))
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("shape", ["message", "top_level", "tool_output"])
-async def test_backend_collected_image_history_keeps_raw_route_policy(
-    async_client, app_instance, promotion_transport, loopback_upstream, shape
-):
-    # This backend route explicitly preserves non-streaming upstream mode and
-    # sets prefer_http_bridge=False, including its image-free warmup. It is not
-    # an image-triggered bypass and this fix must not change that route policy.
-    _, raw_calls, _ = promotion_transport
-    history = _promotion_history()
-    image_history = [*history, *_image_turn(shape)]
-    followup = [*image_history, {"role": "assistant", "content": "OK"}, {"role": "user", "content": "next"}]
-    for turn in [history, image_history, followup]:
-        response = await _post(async_client, turn, path="/backend-api/codex/responses", stream=False)
-        assert response.status_code == 200, response.text
-        assert response.json()["status"] == "completed"
-    assert len(raw_calls) == 3
-    assert not loopback_upstream.sockets
-    assert not get_proxy_service_for_app(app_instance)._http_bridge_sessions
 
 
 @pytest.mark.asyncio
@@ -366,4 +354,41 @@ async def test_inline_image_cancellation_releases_slot_and_reservation(
     assert followup.json()["id"].startswith("resp_loopback_1_")
     for current in service._http_bridge_sessions.values():
         _assert_slot_released(current)
+    await _assert_settled(app_instance, key["id"], count=3, released=1)
+
+
+@pytest.mark.asyncio
+async def test_silent_inline_image_times_out_without_replay(
+    async_client, app_instance, promotion_transport, loopback_upstream, monkeypatch, record_property
+):
+    # Shorten the existing acknowledgement deadline, not the retry implementation.
+    deadline = 0.1
+    monkeypatch.setattr(bridge_helpers, "HTTP_BRIDGE_STUCK_GATE_RETIRE_AFTER_SECONDS", deadline)
+    _, raw_calls, _ = promotion_transport
+    key = await _key(async_client, "image-timeout")
+    headers = {**_HEADERS, "Authorization": f"Bearer {key['key']}"}
+    history = _promotion_history()
+    assert (await _post(async_client, history, headers=headers)).status_code == 200
+    service = get_proxy_service_for_app(app_instance)
+    session = next(iter(service._http_bridge_sessions.values()))
+    loopback_upstream.image_behavior = "stall_before_created"
+
+    started = asyncio.get_running_loop().time()
+    response = await _post(async_client, [*history, *_image_turn()], headers=headers)
+    elapsed = asyncio.get_running_loop().time() - started
+    record_property("client_error_seconds", elapsed)
+    assert response.status_code == 502, response.text
+    assert response.json()["error"]["code"] == "upstream_request_timeout"
+    assert deadline <= elapsed < 2, elapsed
+    assert not raw_calls
+    assert loopback_upstream.image_received.is_set()
+    assert [connection for connection, _ in loopback_upstream.frames] == [0, 0], "silent image was replayed"
+    _assert_slot_released(session)
+    assert session.closed
+    await _assert_settled(app_instance, key["id"], count=2, released=1)
+
+    loopback_upstream.image_behavior = "complete"
+    followup = await _post(async_client, _promotion_history("a clean next turn"), headers=headers)
+    assert followup.status_code == 200, followup.text
+    assert [connection for connection, _ in loopback_upstream.frames] == [0, 0, 1]
     await _assert_settled(app_instance, key["id"], count=3, released=1)

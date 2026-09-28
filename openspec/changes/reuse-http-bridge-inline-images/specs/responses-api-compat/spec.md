@@ -1,8 +1,3 @@
-## RENAMED Requirements
-
-- FROM: `### Requirement: Responses input images bypass the HTTP bridge`
-- TO: `### Requirement: Responses input image bridge eligibility`
-
 ## MODIFIED Requirements
 
 ### Requirement: Responses input image bridge eligibility
@@ -12,6 +7,8 @@ For `/v1/responses` and `/backend-api/codex/responses`, including equivalent tra
 Unsupported uploaded-image references MUST still be rejected before bridge dispatch. External HTTP(S) image URLs at any input nesting depth and over-budget image requests MUST retain their non-bridge HTTP routing. Image-generation tools, explicit HTTP controls, disabled bridge, outage fallback and gateway-safe-mode constraints MUST retain their existing behavior. These request-scoped exclusions MUST NOT disable later eligible bridge requests. Compact requests MUST retain their existing transport and validation behavior.
 
 An upstream terminal image error received before `response.created` MUST settle the owning request without waiting for an acknowledgement timeout, preserve the client-facing error contract, and release its pending slot, response-create gate and API-key reservation. Cancellation MUST release local request resources and isolate ambiguous upstream work using the ordinary bridge retirement rules. A subsequent eligible request MUST be able to complete without consuming stale image-turn events or inheriting an unsettled reservation.
+
+An image request that receives no response-lifecycle event MUST fail at the existing response-create acknowledgement deadline without pre-created replay of its image payload. The bridge MUST retire the ambiguous session and settle the slot, gate and API-key reservation. Silence MUST NOT be reported as a validated invalid-image error.
 
 #### Scenario: Inline image retained across later text turns
 
@@ -39,6 +36,14 @@ An upstream terminal image error received before `response.created` MUST settle 
 - **THEN** the request promptly returns the existing client-facing error
 - **AND** its slot, gate and API-key reservation are settled
 - **AND** a later eligible text request can complete
+
+#### Scenario: Silent image upstream is not replayed
+
+- **GIVEN** an inline-image request has been sent on a reusable bridge session
+- **WHEN** no response-lifecycle event arrives before the existing acknowledgement deadline
+- **THEN** the client receives an upstream timeout without resending the image
+- **AND** the session is retired and its slot, gate and reservation are settled
+- **AND** a later eligible text request can complete on a fresh session
 
 #### Scenario: Cancellation isolates ambiguous image work
 

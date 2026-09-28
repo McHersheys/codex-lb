@@ -276,9 +276,11 @@ pins and size bypasses remain effective. Below-budget inline `data:` images,
 including retained history, now use the ordinary reusable HTTP session bridge.
 An `input_image` request bypasses it and keeps upstream HTTP only when its
 payload exceeds the WebSocket frame budget or still carries an external image
-URL. The #903 invalid-image pending-slot concern is covered by pre-created
-terminal-error and cancellation settlement regressions rather than a blanket
-bypass. This restores local connection reuse, not proof of provider cache hits.
+URL. Synthetic pre-created error, cancellation and silent-upstream regressions
+cover local settlement; they do not reproduce the uncaptured #903 provider frame.
+A silent image request fails at the existing acknowledgement deadline (normally
+60 seconds) without image replay. Current-turn bridge eligibility still requires
+a maintainer decision. Connection reuse is not proof of provider cache hits.
 The backend compatibility route with explicit `stream: false` remains on its
 existing non-bridge collection path even without images. External-URL detection
 for that decision recurses the whole input, so
